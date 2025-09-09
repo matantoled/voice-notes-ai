@@ -50,7 +50,7 @@ def load_records() -> pd.DataFrame:
         rows.append(
             {
                 "base": base,
-                "date": dt.date(),  # compare as plain date
+                "date": dt.date(),
                 "datetime": dt,
                 "year": dt.year,
                 "month": dt.strftime("%Y-%m"),
@@ -73,24 +73,9 @@ def load_records() -> pd.DataFrame:
     if not rows:
         return pd.DataFrame(
             columns=[
-                "base",
-                "date",
-                "datetime",
-                "year",
-                "month",
-                "weekday",
-                "hour",
-                "language",
-                "model",
-                "compute_type",
-                "vad",
-                "duration_min",
-                "speech_min",
-                "silence_ratio",
-                "segments",
-                "words",
-                "wpm",
-                "text",
+                "base","date","datetime","year","month","weekday","hour",
+                "language","model","compute_type","vad",
+                "duration_min","speech_min","silence_ratio","segments","words","wpm","text",
             ]
         )
 
@@ -102,7 +87,7 @@ def load_records() -> pd.DataFrame:
     return df
 
 
-# very lightweight tokenizer (supports English + any Unicode letters)
+# simple tokenizer (Unicode-friendly) + minimal English stopwords
 STOP = set(
     """
 the a an and or of to in for on with that this is are was were be been from at by as it you your we i me my our us they them their his her its not no yes do did done
@@ -153,25 +138,21 @@ with st.sidebar:
     )
     show_vad = st.selectbox("VAD", ["All", "Only VAD", "Only No-VAD"], index=0)
 
-# normalize date selection (always plain date objects)
+# normalize dates
 if isinstance(dr, tuple) and len(dr) == 2:
     d_from, d_to = dr
 else:
     d_from, d_to = (dr, dr)
-
 if not isinstance(d_from, date):
     d_from = pd.to_datetime(d_from).date()
 if not isinstance(d_to, date):
     d_to = pd.to_datetime(d_to).date()
 
-# build mask: compare date ↔ date
 mask = (df["date"] >= d_from) & (df["date"] <= d_to)
-
 if langs:
     mask &= df["language"].isin(langs)
 if models:
     mask &= df["model"].isin(models)
-
 if show_vad == "Only VAD":
     mask &= df["vad"] == True
 elif show_vad == "Only No-VAD":
@@ -182,7 +163,7 @@ if fdf.empty:
     st.warning("No data after filters — try widening the range.")
     st.stop()
 
-# ------------------ top metrics ------------------
+# ------------------ KPIs ------------------
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Transcripts", f"{len(fdf)}")
 c2.metric("Total minutes", f"{fdf['duration_min'].sum():.1f}")
@@ -205,38 +186,37 @@ h4.markdown(f"**Lowest silence**: {hl4['base']}  \n{(hl4['silence_ratio']*100):.
 
 st.markdown("---")
 
-# ------------------ row 1 charts ------------------
+# ------------------ row 1: Top durations (no time dependency) + Languages ------------------
 lc, rc = st.columns([2, 1])
 
 with lc:
-    st.subheader("Minutes by day")
-    daily = fdf.groupby("date", as_index=False)["duration_min"].sum().sort_values("date")
-    daily["ma7"] = daily["duration_min"].rolling(7, min_periods=1).mean()
+    st.subheader("Top transcripts by duration (min)")
 
-    if len(daily) == 0:
-        st.info("No data in the selected range.")
-    elif len(daily) == 1:
-        # single day -> show a bar so it's visible
-        bar = alt.Chart(daily).mark_bar().encode(
-            x=alt.X("date:T", title="date"),
-            y=alt.Y("duration_min:Q", title="Minutes"),
-            tooltip=["date:T", alt.Tooltip("duration_min:Q", title="Minutes", format=".1f")],
-        )
-        st.altair_chart(bar, use_container_width=True)
+    # Safe bounds for slider (works with tiny datasets)
+    n_total = len(fdf)
+    n_max = max(1, min(20, n_total))      # at least 1, at most 20
+    default = min(10, n_max)              # default within bounds
+
+    if n_max == 1:
+        top_n = 1
+        st.caption("Showing top 1 (only one transcript).")
     else:
-        # 2+ days -> area + moving-average line + points
-        base = alt.Chart(daily).encode(x=alt.X("date:T", title="date"))
-        area = base.mark_area(opacity=0.3).encode(
-            y=alt.Y("duration_min:Q", title="Minutes")
-        )
-        line = base.mark_line().encode(
-            y=alt.Y("ma7:Q", title="Minutes (7-day MA)")
-        )
-        pts = base.mark_point(size=50, opacity=0.7).encode(
-            y="duration_min:Q",
-            tooltip=["date:T", alt.Tooltip("duration_min:Q", title="Minutes", format=".1f")],
-        )
-        st.altair_chart(area + line + pts, use_container_width=True)
+        top_n = st.slider("Top-N", 1, n_max, default, key="topn_duration")
+
+    topd = (
+        fdf.nlargest(top_n, "duration_min")[["base", "duration_min"]]
+        .iloc[::-1]  # reverse for nicer order (longest at top)
+    )
+
+    bar = alt.Chart(topd).mark_bar().encode(
+        x=alt.X("duration_min:Q", title="Minutes"),
+        y=alt.Y("base:N", title="Transcript", sort=None),
+        tooltip=[
+            alt.Tooltip("base:N", title="Transcript"),
+            alt.Tooltip("duration_min:Q", title="Minutes", format=".1f"),
+        ],
+    )
+    st.altair_chart(bar, use_container_width=True)
 
 with rc:
     st.subheader("Languages")
@@ -247,30 +227,58 @@ with rc:
     )
     st.altair_chart(chart, use_container_width=True)
 
-# ------------------ row 2 charts ------------------
+# ------------------ row 2: Quadrant + Scatter ------------------
 lc2, rc2 = st.columns(2)
 
 with lc2:
-    st.subheader("Activity heatmap (hour × weekday)")
-    heat = fdf.groupby(["weekday", "hour"], as_index=False)["duration_min"].sum()
-    cats = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    heat["weekday"] = pd.Categorical(heat["weekday"], categories=cats, ordered=True)
-    hm = alt.Chart(heat).mark_rect().encode(
-        x=alt.X("hour:O", title="Hour"),
-        y=alt.Y("weekday:O", title="Weekday"),
-        tooltip=["weekday", "hour", "duration_min"],
-        color=alt.Color("duration_min:Q", title="Minutes"),
+    st.subheader("Silence (%) vs WPM (quadrant)")
+    qdf = fdf.assign(silence_pct=(fdf["silence_ratio"] * 100.0))
+    med_wpm = float(qdf["wpm"].median()) if not qdf.empty else 0.0
+    med_sil = float(qdf["silence_pct"].median()) if not qdf.empty else 0.0
+
+    base = alt.Chart(qdf).encode(
+        x=alt.X("wpm:Q", title="WPM"),
+        y=alt.Y("silence_pct:Q", title="Silence (%)"),
+        color=alt.Color("language:N", title="Lang"),
+        tooltip=["base","language","wpm",alt.Tooltip("silence_pct:Q", title="Silence (%)", format=".0f")]
     )
-    st.altair_chart(hm, use_container_width=True)
+    pts = base.mark_circle(size=90, opacity=0.7)
+    rule_x = alt.Chart(pd.DataFrame({"x":[med_wpm]})).mark_rule(strokeDash=[4,4]).encode(x="x:Q")
+    rule_y = alt.Chart(pd.DataFrame({"y":[med_sil]})).mark_rule(strokeDash=[4,4]).encode(y="y:Q")
+    st.altair_chart(pts + rule_x + rule_y, use_container_width=True)
 
 with rc2:
     st.subheader("Duration vs Words")
     scat = alt.Chart(fdf).mark_circle(size=80, opacity=0.6).encode(
         x=alt.X("duration_min:Q", title="Duration (min)"),
         y=alt.Y("words:Q", title="Words"),
-        tooltip=["base", "date", "language", "duration_min", "words", "wpm"],
+        color=alt.Color("language:N", title="Lang"),
+        tooltip=["base", "language", "duration_min", "words", "wpm"],
     )
     st.altair_chart(scat, use_container_width=True)
+
+st.markdown("---")
+
+# ------------------ row 3: Distributions ------------------
+dc1, dc2 = st.columns(2)
+
+with dc1:
+    st.subheader("WPM distribution")
+    hist_wpm = alt.Chart(fdf).mark_bar().encode(
+        x=alt.X("bin(wpm, step=10):Q", title="WPM"),
+        y=alt.Y("count():Q", title="Count"),
+        tooltip=[alt.Tooltip("count():Q", title="Count")]
+    )
+    st.altair_chart(hist_wpm, use_container_width=True)
+
+with dc2:
+    st.subheader("Segments distribution")
+    hist_seg = alt.Chart(fdf).mark_bar().encode(
+        x=alt.X("bin(segments, step=5):Q", title="Segments"),
+        y=alt.Y("count():Q", title="Count"),
+        tooltip=[alt.Tooltip("count():Q", title="Count")]
+    )
+    st.altair_chart(hist_seg, use_container_width=True)
 
 st.markdown("---")
 
@@ -280,10 +288,10 @@ kw = top_keywords(fdf, k=30)
 kc1, kc2 = st.columns([1, 1])
 
 with kc1:
-    bar = alt.Chart(kw).mark_bar().encode(
+    bar_kw = alt.Chart(kw).mark_bar().encode(
         x="count:Q", y=alt.Y("token:N", sort="-x"), tooltip=["token", "count"]
     )
-    st.altair_chart(bar, use_container_width=True)
+    st.altair_chart(bar_kw, use_container_width=True)
 
 with kc2:
     if WORDCLOUD_OK and not kw.empty:
