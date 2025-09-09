@@ -1,8 +1,13 @@
 import os, math, tempfile, json, re
 from datetime import datetime
 
+import numpy as np
 import streamlit as st
 from faster_whisper import WhisperModel
+from sentence_transformers import SentenceTransformer
+
+# ----- constants -----
+EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # multilingual (he/en)
 
 # ---------- Page setup ----------
 st.set_page_config(page_title="Interview Transcriber", layout="wide")
@@ -22,6 +27,11 @@ with st.sidebar:
 def load_model(size: str, ctype: str):
     # Load once (cached) to speed up subsequent runs
     return WhisperModel(size, device="cpu", compute_type=ctype)
+
+@st.cache_resource
+def get_embedder():
+    # Load embedding model once (cached)
+    return SentenceTransformer(EMBED_MODEL)
 
 def save_uploaded_to_temp(uploaded) -> str:
     # Save the uploaded file to a temporary path so the ASR can read it
@@ -79,6 +89,27 @@ def save_all(transcript_text: str, segments: list, info, uploaded_name: str,
 
     return base
 
+def compute_and_save_embeddings(segments: list, base: str):
+    # Build embeddings for each segment and save to outputs/<base>.npz
+    texts = [s["text"].strip() for s in segments if s["text"].strip()]
+    starts = np.array([s["start"] for s in segments if s["text"].strip()], dtype=np.float32)
+    ends   = np.array([s["end"]   for s in segments if s["text"].strip()], dtype=np.float32)
+    if len(texts) == 0:
+        return False
+
+    embedder = get_embedder()
+    emb = embedder.encode(texts, convert_to_numpy=True, normalize_embeddings=True)  # cosine-ready
+
+    np.savez(
+        f"outputs/{base}.npz",
+        emb=emb.astype(np.float32),
+        starts=starts,
+        ends=ends,
+        texts=np.array(texts, dtype=object),
+        embed_model=EMBED_MODEL
+    )
+    return True
+
 # ---------- UI: upload ----------
 uploaded = st.file_uploader(
     "Upload an audio file",
@@ -122,6 +153,14 @@ if start:
         # Persist outputs (TXT/SRT/JSON)
         base = save_all(transcript_text, segments, info, uploaded.name, model_size, compute_type, use_vad)
         st.info(f"Saved: outputs/{base}.txt · outputs/{base}.srt · outputs/{base}.json")
+
+        # NEW: embeddings
+        with st.spinner("Indexing (embeddings)..."):
+            ok = compute_and_save_embeddings(segments, base)
+        if ok:
+            st.success(f"Embeddings saved: outputs/{base}.npz")
+        else:
+            st.warning("No non-empty segments to index.")
 
         with st.expander("Transcript"):
             st.text_area("Text", transcript_text, height=220)
