@@ -1,4 +1,6 @@
-import os, math, tempfile
+import os, math, tempfile, json, re
+from datetime import datetime
+
 import streamlit as st
 from faster_whisper import WhisperModel
 
@@ -46,6 +48,37 @@ def segments_to_srt(segs) -> str:
         )
     return "\n".join(lines)
 
+def slugify(name: str) -> str:
+    # Safe filename: letters, numbers, dash, underscore
+    return re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-").lower()
+
+def save_all(transcript_text: str, segments: list, info, uploaded_name: str,
+             model_size: str, compute_type: str, use_vad: bool) -> str:
+    # Persist TXT/SRT/JSON under outputs/
+    os.makedirs("outputs", exist_ok=True)
+    base = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{slugify(os.path.splitext(uploaded_name)[0])}"
+
+    with open(f"outputs/{base}.txt", "w", encoding="utf-8") as f:
+        f.write(transcript_text)
+
+    with open(f"outputs/{base}.srt", "w", encoding="utf-8") as f:
+        f.write(segments_to_srt(segments))
+
+    meta = {
+        "source_file": uploaded_name,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+        "language": getattr(info, "language", None),
+        "language_probability": getattr(info, "language_probability", None),
+        "model": model_size,
+        "compute_type": compute_type,
+        "vad": use_vad,
+        "segments": segments,
+    }
+    with open(f"outputs/{base}.json", "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    return base
+
 # ---------- UI: upload ----------
 uploaded = st.file_uploader(
     "Upload an audio file",
@@ -85,6 +118,10 @@ if start:
         # Display
         st.success(f"Done. Detected language: {info.language} (p={info.language_probability:.2f})")
         transcript_text = "\n".join(s["text"].strip() for s in segments)
+
+        # Persist outputs (TXT/SRT/JSON)
+        base = save_all(transcript_text, segments, info, uploaded.name, model_size, compute_type, use_vad)
+        st.info(f"Saved: outputs/{base}.txt · outputs/{base}.srt · outputs/{base}.json")
 
         with st.expander("Transcript"):
             st.text_area("Text", transcript_text, height=220)
