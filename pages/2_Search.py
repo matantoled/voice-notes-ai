@@ -92,7 +92,6 @@ with st.spinner("Searching..."):
     qv = embedder.encode([q], convert_to_numpy=True, normalize_embeddings=True)
     D, I = index.search(qv.astype(np.float32), top_k * 5)  # fetch more to allow filtering/dedup
 
-# Build results with filters
 def norm_text(t: str) -> str:
     return " ".join(t.lower().split())
 
@@ -128,4 +127,14 @@ if not kept:
 else:
     for r in kept:
         with st.expander(f"[{s_to_timestamp(r['start'])} → {s_to_timestamp(r['end'])}] • {r['base']} • score={r['score']:.3f}"):
-            st.write(r["text"])
+            # Copy-friendly blocks
+            st.caption("Timestamp")
+            st.code(f"{s_to_timestamp(r['start'])} --> {s_to_timestamp(r['end'])}")
+            st.caption("Text")
+            st.code(r["text"])
+
+            # Download single-cue SRT for the snippet
+            snippet_srt = f"1\n{s_to_timestamp(r['start'])} --> {s_to_timestamp(r['end'])}\n{r['text'].strip()}\n"
+            st.download_button("⬇ SRT (this snippet)", snippet_srt.encode("utf-8"),
+                               file_name=f"{r['base']}_{int(r['start'])}-{int(r['end'])}.srt",
+                               key=f"dl_snip_{r['base']}_{r['start']:.2f}")

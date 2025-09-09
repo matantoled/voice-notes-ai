@@ -1,7 +1,8 @@
-import os, math, tempfile, json, re
+import os, math, tempfile, json, re, shutil
 from datetime import datetime
 
 import numpy as np
+import pandas as pd
 import streamlit as st
 from faster_whisper import WhisperModel
 from sentence_transformers import SentenceTransformer
@@ -21,6 +22,7 @@ with st.sidebar:
     compute_type = st.selectbox("Compute type (CPU)", ["int8", "int8_float32", "float32"], index=0)
     language_hint = st.selectbox("Language hint", ["auto", "en", "he", "ar", "ru", "fr", "es"], index=0)
     use_vad = st.toggle("VAD (remove silence/noise)", value=True)
+    save_audio_orig = st.toggle("Save original audio file", value=True)
 
 # ---------- Helpers ----------
 @st.cache_resource
@@ -63,8 +65,12 @@ def slugify(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-").lower()
 
 def save_all(transcript_text: str, segments: list, info, uploaded_name: str,
-             model_size: str, compute_type: str, use_vad: bool) -> str:
-    # Persist TXT/SRT/JSON under outputs/
+             model_size: str, compute_type: str, use_vad: bool,
+             audio_src_path: str, save_audio_orig: bool) -> str:
+    """
+    Persist TXT/SRT/JSON under outputs/. Optionally copy original audio.
+    Returns base filename (without extension).
+    """
     os.makedirs("outputs", exist_ok=True)
     base = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{slugify(os.path.splitext(uploaded_name)[0])}"
 
@@ -74,6 +80,15 @@ def save_all(transcript_text: str, segments: list, info, uploaded_name: str,
     with open(f"outputs/{base}.srt", "w", encoding="utf-8") as f:
         f.write(segments_to_srt(segments))
 
+    audio_saved = None
+    if save_audio_orig:
+        suffix = os.path.splitext(uploaded_name)[1]
+        audio_saved = f"{base}{suffix}"
+        try:
+            shutil.copyfile(audio_src_path, os.path.join("outputs", audio_saved))
+        except Exception:
+            audio_saved = None  # don't fail save if copy fails
+
     meta = {
         "source_file": uploaded_name,
         "saved_at": datetime.now().isoformat(timespec="seconds"),
@@ -82,6 +97,7 @@ def save_all(transcript_text: str, segments: list, info, uploaded_name: str,
         "model": model_size,
         "compute_type": compute_type,
         "vad": use_vad,
+        "audio_saved": audio_saved,             # NEW
         "segments": segments,
     }
     with open(f"outputs/{base}.json", "w", encoding="utf-8") as f:
@@ -150,11 +166,35 @@ if start:
         st.success(f"Done. Detected language: {info.language} (p={info.language_probability:.2f})")
         transcript_text = "\n".join(s["text"].strip() for s in segments)
 
-        # Persist outputs (TXT/SRT/JSON)
-        base = save_all(transcript_text, segments, info, uploaded.name, model_size, compute_type, use_vad)
-        st.info(f"Saved: outputs/{base}.txt · outputs/{base}.srt · outputs/{base}.json")
+        # Basic stats & chart
+        total_seconds = segments[-1]["end"] if segments else 0.0
+        word_count = len(transcript_text.split())
+        wpm = (word_count / (total_seconds / 60.0)) if total_seconds > 0 else 0.0
+        seg_durations = [max(0.0, s["end"] - s["start"]) for s in segments]
 
-        # NEW: embeddings
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Segments", f"{len(segments)}")
+        m2.metric("Duration", f"{total_seconds/60:.1f} min")
+        m3.metric("Words", f"{word_count}")
+        m4.metric("WPM", f"{wpm:.0f}")
+
+        if segments:
+            df = pd.DataFrame({
+                "segment": list(range(1, len(segments) + 1)),
+                "duration_sec": seg_durations
+            })
+            st.caption("Segment durations")
+            st.bar_chart(df, x="segment", y="duration_sec", height=160)
+
+        # Persist outputs (TXT/SRT/JSON + optional audio copy)
+        base = save_all(
+            transcript_text, segments, info, uploaded.name,
+            model_size, compute_type, use_vad,
+            audio_src_path=audio_path, save_audio_orig=save_audio_orig
+        )
+        st.info(f"Saved: outputs/{base}.txt · outputs/{base}.srt · outputs/{base}.json" + (f" · outputs/{base}{os.path.splitext(uploaded.name)[1]}" if save_audio_orig else ""))
+
+        # Embeddings
         with st.spinner("Indexing (embeddings)..."):
             ok = compute_and_save_embeddings(segments, base)
         if ok:
