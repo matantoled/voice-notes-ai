@@ -21,9 +21,9 @@ import re
 OUTPUT_DIR = "outputs"
 EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
-st.set_page_config(page_title="Interview Transcriber", layout="wide")
-st.title("🎙️ Interview Transcriber")
-st.caption("Local transcription with faster-whisper (no cloud)")
+st.set_page_config(page_title="Local AI Transcript Studio", layout="wide")
+st.title("🎙️ Local AI Transcript Studio")
+st.caption("Local AI transcription with semantic search & summaries (no cloud)")
 
 # ---------- Sidebar ----------
 with st.sidebar:
