@@ -1,14 +1,13 @@
-import os, math, tempfile, json, re, shutil
-from datetime import datetime
-
-import numpy as np
-import pandas as pd
+import os, math, tempfile, time
 import streamlit as st
 from faster_whisper import WhisperModel
-from sentence_transformers import SentenceTransformer
 
-# ----- constants -----
-EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"  # multilingual (he/en)
+# ---------- NEW: summarization & NLP ----------
+import nltk
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.lex_rank import LexRankSummarizer
+import re
 
 # ---------- Page setup ----------
 st.set_page_config(page_title="Interview Transcriber", layout="wide")
@@ -22,18 +21,12 @@ with st.sidebar:
     compute_type = st.selectbox("Compute type (CPU)", ["int8", "int8_float32", "float32"], index=0)
     language_hint = st.selectbox("Language hint", ["auto", "en", "he", "ar", "ru", "fr", "es"], index=0)
     use_vad = st.toggle("VAD (remove silence/noise)", value=True)
-    save_audio_orig = st.toggle("Save original audio file", value=True)
 
 # ---------- Helpers ----------
 @st.cache_resource
 def load_model(size: str, ctype: str):
     # Load once (cached) to speed up subsequent runs
     return WhisperModel(size, device="cpu", compute_type=ctype)
-
-@st.cache_resource
-def get_embedder():
-    # Load embedding model once (cached)
-    return SentenceTransformer(EMBED_MODEL)
 
 def save_uploaded_to_temp(uploaded) -> str:
     # Save the uploaded file to a temporary path so the ASR can read it
@@ -60,71 +53,63 @@ def segments_to_srt(segs) -> str:
         )
     return "\n".join(lines)
 
-def slugify(name: str) -> str:
-    # Safe filename: letters, numbers, dash, underscore
-    return re.sub(r"[^a-zA-Z0-9_-]+", "-", name).strip("-").lower()
+# ---------- NEW: NLTK bootstrap ----------
+def _ensure_nltk():
+    try:
+        nltk.data.find("tokenizers/punkt")
+    except LookupError:
+        nltk.download("punkt", quiet=True)
+    try:
+        nltk.data.find("corpora/stopwords")
+    except LookupError:
+        nltk.download("stopwords", quiet=True)
 
-def save_all(transcript_text: str, segments: list, info, uploaded_name: str,
-             model_size: str, compute_type: str, use_vad: bool,
-             audio_src_path: str, save_audio_orig: bool) -> str:
+# ---------- NEW: text summarization (local) ----------
+def summarize_text(text: str, max_sentences: int = 5) -> str:
     """
-    Persist TXT/SRT/JSON under outputs/. Optionally copy original audio.
-    Returns base filename (without extension).
+    Summarize long text into up to max_sentences sentences (English best).
+    Falls back gracefully if text is short or unsupported.
     """
-    os.makedirs("outputs", exist_ok=True)
-    base = f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-{slugify(os.path.splitext(uploaded_name)[0])}"
+    text = (text or "").strip()
+    if not text:
+        return ""
+    _ensure_nltk()
+    try:
+        parser = PlaintextParser.from_string(text, Tokenizer("english"))
+        summarizer = LexRankSummarizer()
+        sent_count = min(max_sentences, max(1, len(parser.document.sentences) // 3 or 1))
+        summary_sents = summarizer(parser.document, sent_count)
+        summary = " ".join(str(s) for s in summary_sents).strip()
+        if not summary:
+            summary = " ".join(str(s) for s in parser.document.sentences[:max_sentences]).strip()
+        return summary
+    except Exception:
+        return " ".join(text.split(". ")[:max_sentences]).strip()
 
-    with open(f"outputs/{base}.txt", "w", encoding="utf-8") as f:
-        f.write(transcript_text)
-
-    with open(f"outputs/{base}.srt", "w", encoding="utf-8") as f:
-        f.write(segments_to_srt(segments))
-
-    audio_saved = None
-    if save_audio_orig:
-        suffix = os.path.splitext(uploaded_name)[1]
-        audio_saved = f"{base}{suffix}"
-        try:
-            shutil.copyfile(audio_src_path, os.path.join("outputs", audio_saved))
-        except Exception:
-            audio_saved = None  # don't fail save if copy fails
-
-    meta = {
-        "source_file": uploaded_name,
-        "saved_at": datetime.now().isoformat(timespec="seconds"),
-        "language": getattr(info, "language", None),
-        "language_probability": getattr(info, "language_probability", None),
-        "model": model_size,
-        "compute_type": compute_type,
-        "vad": use_vad,
-        "audio_saved": audio_saved,             # NEW
-        "segments": segments,
-    }
-    with open(f"outputs/{base}.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-
-    return base
-
-def compute_and_save_embeddings(segments: list, base: str):
-    # Build embeddings for each segment and save to outputs/<base>.npz
-    texts = [s["text"].strip() for s in segments if s["text"].strip()]
-    starts = np.array([s["start"] for s in segments if s["text"].strip()], dtype=np.float32)
-    ends   = np.array([s["end"]   for s in segments if s["text"].strip()], dtype=np.float32)
-    if len(texts) == 0:
-        return False
-
-    embedder = get_embedder()
-    emb = embedder.encode(texts, convert_to_numpy=True, normalize_embeddings=True)  # cosine-ready
-
-    np.savez(
-        f"outputs/{base}.npz",
-        emb=emb.astype(np.float32),
-        starts=starts,
-        ends=ends,
-        texts=np.array(texts, dtype=object),
-        embed_model=EMBED_MODEL
-    )
-    return True
+# ---------- NEW: naive action-items (local, rule-based) ----------
+def extract_action_items(text: str) -> list[str]:
+    """
+    Simple heuristic: pick sentences that *look* like tasks/requests.
+    Works best in English. Tune patterns later as you like.
+    """
+    _ensure_nltk()
+    sents = nltk.sent_tokenize(text or "")
+    patterns = [
+        r"^(let's|please)\b",
+        r"\bwe\s+(need|should|must)\b",
+        r"\b(i|we|you)\s+will\b",
+        r"\b(todo|follow\s*up|schedule|prepare|create|fix|update|review|send)\b",
+        r"\bby\s+(tomorrow|monday|tuesday|wednesday|thursday|friday|next week|\d{1,2}/\d{1,2})\b",
+    ]
+    rx = re.compile("|".join(patterns), re.IGNORECASE)
+    items = [s.strip() for s in sents if rx.search(s)]
+    seen, out = set(), []
+    for s in items:
+        key = s.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(s)
+    return out[:20]
 
 # ---------- UI: upload ----------
 uploaded = st.file_uploader(
@@ -166,42 +151,6 @@ if start:
         st.success(f"Done. Detected language: {info.language} (p={info.language_probability:.2f})")
         transcript_text = "\n".join(s["text"].strip() for s in segments)
 
-        # Basic stats & chart
-        total_seconds = segments[-1]["end"] if segments else 0.0
-        word_count = len(transcript_text.split())
-        wpm = (word_count / (total_seconds / 60.0)) if total_seconds > 0 else 0.0
-        seg_durations = [max(0.0, s["end"] - s["start"]) for s in segments]
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Segments", f"{len(segments)}")
-        m2.metric("Duration", f"{total_seconds/60:.1f} min")
-        m3.metric("Words", f"{word_count}")
-        m4.metric("WPM", f"{wpm:.0f}")
-
-        if segments:
-            df = pd.DataFrame({
-                "segment": list(range(1, len(segments) + 1)),
-                "duration_sec": seg_durations
-            })
-            st.caption("Segment durations")
-            st.bar_chart(df, x="segment", y="duration_sec", height=160)
-
-        # Persist outputs (TXT/SRT/JSON + optional audio copy)
-        base = save_all(
-            transcript_text, segments, info, uploaded.name,
-            model_size, compute_type, use_vad,
-            audio_src_path=audio_path, save_audio_orig=save_audio_orig
-        )
-        st.info(f"Saved: outputs/{base}.txt · outputs/{base}.srt · outputs/{base}.json" + (f" · outputs/{base}{os.path.splitext(uploaded.name)[1]}" if save_audio_orig else ""))
-
-        # Embeddings
-        with st.spinner("Indexing (embeddings)..."):
-            ok = compute_and_save_embeddings(segments, base)
-        if ok:
-            st.success(f"Embeddings saved: outputs/{base}.npz")
-        else:
-            st.warning("No non-empty segments to index.")
-
         with st.expander("Transcript"):
             st.text_area("Text", transcript_text, height=220)
 
@@ -209,13 +158,34 @@ if start:
             for i, s in enumerate(segments, start=1):
                 st.write(f"{i:03d} [{s_to_timestamp(s['start'])} → {s_to_timestamp(s['end'])}] {s['text']}")
 
-        # Downloads
+        # Downloads (TXT / SRT)
         srt_text = segments_to_srt(segments)
         c1, c2 = st.columns(2)
         with c1:
             st.download_button("⬇ TXT", transcript_text.encode("utf-8"), "transcript.txt")
         with c2:
             st.download_button("⬇ SRT", srt_text.encode("utf-8"), "transcript.srt")
+
+        # ---------- NEW: Auto summary + Action items ----------
+        with st.spinner("Summarizing (local)..."):
+            summary = summarize_text(transcript_text, max_sentences=5)
+            actions = extract_action_items(transcript_text)
+
+        with st.expander("Auto-summary"):
+            if summary:
+                st.write(summary)
+                st.download_button("⬇ Summary (TXT)", summary.encode("utf-8"), "summary.txt")
+            else:
+                st.info("No summary available for this audio.")
+
+        with st.expander("Action items"):
+            if actions:
+                for i, line in enumerate(actions, start=1):
+                    st.write(f"{i}. {line}")
+                actions_txt = "\n".join(f"- {a}" for a in actions)
+                st.download_button("⬇ Action items (TXT)", actions_txt.encode("utf-8"), "action_items.txt")
+            else:
+                st.info("No action items found.")
 
     except Exception as e:
         # Typical case: FFmpeg not installed or not in PATH
