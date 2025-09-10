@@ -1,6 +1,11 @@
-import os, math, tempfile, time
+import os, math, tempfile, time, json, shutil
+from datetime import datetime
+import numpy as np
 import streamlit as st
 from faster_whisper import WhisperModel
+
+# Embeddings for semantic search (.npz)
+from sentence_transformers import SentenceTransformer
 
 # ---------- NEW: summarization & NLP ----------
 import nltk
@@ -9,12 +14,15 @@ from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lex_rank import LexRankSummarizer
 import re
 
-# ---------- Page setup ----------
+# ---------- Constants ----------
+OUTPUT_DIR = "outputs"
+EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
 st.set_page_config(page_title="Interview Transcriber", layout="wide")
 st.title("🎙️ Interview Transcriber")
 st.caption("Local transcription with faster-whisper (no cloud)")
 
-# ---------- Sidebar settings ----------
+# ---------- Sidebar ----------
 with st.sidebar:
     st.header("Settings")
     model_size = st.selectbox("Model", ["tiny", "base", "small", "medium", "large-v3"], index=2)
@@ -22,14 +30,20 @@ with st.sidebar:
     language_hint = st.selectbox("Language hint", ["auto", "en", "he", "ar", "ru", "fr", "es"], index=0)
     use_vad = st.toggle("VAD (remove silence/noise)", value=True)
 
-# ---------- Helpers ----------
+# ---------- Caches ----------
 @st.cache_resource
 def load_model(size: str, ctype: str):
-    # Load once (cached) to speed up subsequent runs
     return WhisperModel(size, device="cpu", compute_type=ctype)
 
+@st.cache_resource
+def get_embedder():
+    return SentenceTransformer(EMBED_MODEL)
+
+# ---------- Small helpers ----------
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
 def save_uploaded_to_temp(uploaded) -> str:
-    # Save the uploaded file to a temporary path so the ASR can read it
     suffix = os.path.splitext(uploaded.name)[1]
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(uploaded.read())
@@ -37,7 +51,6 @@ def save_uploaded_to_temp(uploaded) -> str:
     return tmp.name
 
 def s_to_timestamp(s: float) -> str:
-    # Format seconds to SRT timestamp 00:00:00,000
     h = int(s // 3600)
     m = int((s % 3600) // 60)
     sec = int(s % 60)
@@ -45,7 +58,6 @@ def s_to_timestamp(s: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
 
 def segments_to_srt(segs) -> str:
-    # Build SRT text from segment dicts
     lines = []
     for i, g in enumerate(segs, start=1):
         lines.append(
@@ -53,7 +65,7 @@ def segments_to_srt(segs) -> str:
         )
     return "\n".join(lines)
 
-# ---------- NEW: NLTK bootstrap ----------
+# ---------- NLTK bootstrap ----------
 def _ensure_nltk():
     try:
         nltk.data.find("tokenizers/punkt")
@@ -64,12 +76,8 @@ def _ensure_nltk():
     except LookupError:
         nltk.download("stopwords", quiet=True)
 
-# ---------- NEW: text summarization (local) ----------
+# ---------- Summarization & Action Items ----------
 def summarize_text(text: str, max_sentences: int = 5) -> str:
-    """
-    Summarize long text into up to max_sentences sentences (English best).
-    Falls back gracefully if text is short or unsupported.
-    """
     text = (text or "").strip()
     if not text:
         return ""
@@ -86,12 +94,7 @@ def summarize_text(text: str, max_sentences: int = 5) -> str:
     except Exception:
         return " ".join(text.split(". ")[:max_sentences]).strip()
 
-# ---------- NEW: naive action-items (local, rule-based) ----------
 def extract_action_items(text: str) -> list[str]:
-    """
-    Simple heuristic: pick sentences that *look* like tasks/requests.
-    Works best in English. Tune patterns later as you like.
-    """
     _ensure_nltk()
     sents = nltk.sent_tokenize(text or "")
     patterns = [
@@ -110,6 +113,90 @@ def extract_action_items(text: str) -> list[str]:
             seen.add(key)
             out.append(s)
     return out[:20]
+
+# ---------- Persist results to outputs/ ----------
+def unique_base(now_str: str) -> str:
+    """Create a unique base like 20250910-223045, add -2/-3 if exists."""
+    base = now_str
+    i = 2
+    while os.path.exists(os.path.join(OUTPUT_DIR, f"{base}.json")):
+        base = f"{now_str}-{i}"
+        i += 1
+    return base
+
+def save_all_outputs(
+    uploaded, audio_tmp_path: str, segments: list[dict], transcript_text: str,
+    srt_text: str, info, model_size: str, compute_type: str, use_vad: bool
+) -> dict:
+    """
+    Save TXT/SRT/JSON + copy audio + save .npz embeddings for semantic search.
+    Returns dict with paths.
+    """
+    ensure_dir(OUTPUT_DIR)
+
+    # base name
+    now_iso = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    now_str = time.strftime("%Y%m%d-%H%M%S")
+    base = unique_base(now_str)
+
+    # file paths
+    txt_path = os.path.join(OUTPUT_DIR, f"{base}.txt")
+    srt_path = os.path.join(OUTPUT_DIR, f"{base}.srt")
+    json_path = os.path.join(OUTPUT_DIR, f"{base}.json")
+    npz_path = os.path.join(OUTPUT_DIR, f"{base}.npz")
+
+    # copy audio beside outputs (optional but useful for Search snippet playback)
+    audio_ext = os.path.splitext(uploaded.name)[1] or os.path.splitext(audio_tmp_path)[1]
+    audio_name = f"{base}{audio_ext}"
+    audio_out = os.path.join(OUTPUT_DIR, audio_name)
+    try:
+        shutil.copyfile(audio_tmp_path, audio_out)
+        audio_saved = audio_name  # relative
+    except Exception:
+        audio_saved = ""
+
+    # write TXT/SRT
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(transcript_text.strip() + "\n")
+    with open(srt_path, "w", encoding="utf-8") as f:
+        f.write(srt_text)
+
+    # write JSON meta (Dashboard/Recent rely on this)
+    meta = {
+        "base": base,
+        "saved_at": now_iso,
+        "source_file": uploaded.name,
+        "audio_saved": audio_saved,
+        "language": getattr(info, "language", None),
+        "language_probability": getattr(info, "language_probability", None),
+        "model": model_size,
+        "compute_type": compute_type,
+        "vad": bool(use_vad),
+        "segments": segments,  # [{start,end,text}, ...]
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    # embeddings (.npz) for /Search
+    try:
+        embedder = get_embedder()
+        texts = [s["text"] for s in segments]
+        starts = np.array([float(s["start"]) for s in segments], dtype=np.float32)
+        ends = np.array([float(s["end"]) for s in segments], dtype=np.float32)
+        if len(texts) > 0:
+            emb = embedder.encode(texts, convert_to_numpy=True, normalize_embeddings=True).astype(np.float32)
+            np.savez(npz_path, emb=emb, starts=starts, ends=ends, texts=np.array(texts, dtype=object))
+    except Exception as e:
+        st.warning(f"Embeddings save failed (ok to ignore): {e}")
+
+    return {
+        "base": base,
+        "txt": txt_path,
+        "srt": srt_path,
+        "json": json_path,
+        "audio": audio_out if os.path.exists(audio_out) else "",
+        "npz": npz_path if os.path.exists(npz_path) else "",
+    }
 
 # ---------- UI: upload ----------
 uploaded = st.file_uploader(
@@ -130,15 +217,12 @@ if start:
         st.warning("Please upload an audio file first.")
         st.stop()
 
-    # Save a temp copy of the uploaded file
     audio_path = save_uploaded_to_temp(uploaded)
 
     try:
-        # Load model (first time may be slower due to download/init)
         with st.spinner("Loading model... (first time can take a bit)"):
             model = load_model(model_size, compute_type)
 
-        # Real transcription
         with st.spinner("Transcribing..."):
             segments_gen, info = model.transcribe(
                 audio_path,
@@ -147,7 +231,6 @@ if start:
             )
             segments = [{"start": s.start, "end": s.end, "text": s.text} for s in segments_gen]
 
-        # Display
         st.success(f"Done. Detected language: {info.language} (p={info.language_probability:.2f})")
         transcript_text = "\n".join(s["text"].strip() for s in segments)
 
@@ -158,7 +241,7 @@ if start:
             for i, s in enumerate(segments, start=1):
                 st.write(f"{i:03d} [{s_to_timestamp(s['start'])} → {s_to_timestamp(s['end'])}] {s['text']}")
 
-        # Downloads (TXT / SRT)
+        # Build SRT & downloads
         srt_text = segments_to_srt(segments)
         c1, c2 = st.columns(2)
         with c1:
@@ -166,7 +249,7 @@ if start:
         with c2:
             st.download_button("⬇ SRT", srt_text.encode("utf-8"), "transcript.srt")
 
-        # ---------- NEW: Auto summary + Action items ----------
+        # ---------- Auto summary + Action items ----------
         with st.spinner("Summarizing (local)..."):
             summary = summarize_text(transcript_text, max_sentences=5)
             actions = extract_action_items(transcript_text)
@@ -187,8 +270,26 @@ if start:
             else:
                 st.info("No action items found.")
 
+        # ---------- SAVE EVERYTHING to outputs/ ----------
+        with st.spinner("Saving to outputs/…"):
+            saved = save_all_outputs(
+                uploaded=uploaded,
+                audio_tmp_path=audio_path,
+                segments=segments,
+                transcript_text=transcript_text,
+                srt_text=srt_text,
+                info=info,
+                model_size=model_size,
+                compute_type=compute_type,
+                use_vad=use_vad,
+            )
+
+        msg = f"Saved: {os.path.relpath(saved['txt'])} • {os.path.relpath(saved['srt'])} • {os.path.relpath(saved['json'])}"
+        if saved.get("npz"):
+            msg += f" • {os.path.relpath(saved['npz'])}"
+        st.info(msg)
+
     except Exception as e:
-        # Typical case: FFmpeg not installed or not in PATH
         st.error(f"Transcription failed: {e}")
     finally:
         try:

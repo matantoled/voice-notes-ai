@@ -1,4 +1,4 @@
-import os, glob, json, base64, mimetypes
+import os, glob, json, base64, mimetypes, re
 from typing import Tuple, List
 
 import numpy as np
@@ -12,6 +12,15 @@ OUTPUT_DIR = "outputs"
 
 st.set_page_config(page_title="Semantic search", layout="wide")
 st.title("🔎 Semantic search")
+
+# ---------- optional TextRank (sumy) ----------
+_SUMY_OK = True
+try:
+    from sumy.parsers.plaintext import PlaintextParser
+    from sumy.nlp.tokenizers import Tokenizer
+    from sumy.summarizers.text_rank import TextRankSummarizer
+except Exception:
+    _SUMY_OK = False
 
 # ---------- utils ----------
 def s_to_timestamp(s: float) -> str:
@@ -59,6 +68,102 @@ def build_index(sig: str):
     index.add(emb_all)
     return index, emb_all, starts, ends, list(texts), bases
 
+# ---------- transcript/summary helpers ----------
+def _read_txt(base: str) -> tuple[str, float] | tuple[None, None]:
+    p = os.path.join(OUTPUT_DIR, f"{base}.txt")
+    if not os.path.exists(p):
+        return None, None
+    try:
+        with open(p, encoding="utf-8", errors="ignore") as f:
+            return f.read(), os.path.getmtime(p)
+    except Exception:
+        return None, None
+
+def _read_json_text(base: str) -> tuple[str, float] | tuple[None, None]:
+    p = os.path.join(OUTPUT_DIR, f"{base}.json")
+    if not os.path.exists(p):
+        return None, None
+    try:
+        with open(p, encoding="utf-8") as f:
+            meta = json.load(f)
+        segs = meta.get("segments", []) or []
+        text = "\n".join(s.get("text", "") for s in segs)
+        return text, os.path.getmtime(p)
+    except Exception:
+        return None, None
+
+def transcript_text_for_base(base: str) -> tuple[str, float] | tuple[None, None]:
+    txt, mt = _read_txt(base)
+    if txt is not None:
+        return txt, mt
+    return _read_json_text(base)
+
+def _summarize_textrank(text: str, sentences: int = 6) -> str:
+    if not text.strip():
+        return ""
+    if _SUMY_OK:
+        parser = PlaintextParser.from_string(text, Tokenizer("english"))
+        summarizer = TextRankSummarizer()
+        summary = summarizer(parser.document, sentences)
+        return "\n".join(str(s) for s in summary).strip()
+    parts = re.split(r"(?<=[.!?])\s+", text.strip())
+    return " ".join(parts[:sentences]).strip()
+
+def _extract_action_items(text: str, limit: int = 10) -> list[str]:
+    sents = re.split(r"(?<=[.!?])\s+", (text or "").strip())
+    rx = re.compile(
+        r"\b(action items?|todo|follow[- ]?up|next steps?|we (need|should)|let'?s|please|assign|schedule|send|review)\b",
+        re.IGNORECASE,
+    )
+    hits = [s.strip() for s in sents if rx.search(s)]
+    if not hits:
+        rx2 = re.compile(r"\b(need to|should|let'?s|please)\b", re.IGNORECASE)
+        hits = [s.strip() for s in sents if rx2.search(s)]
+    return hits[:limit]
+
+def _summary_paths(base: str) -> tuple[str, str]:
+    return (
+        os.path.join(OUTPUT_DIR, f"{base}.summary.txt"),
+        os.path.join(OUTPUT_DIR, f"{base}.action.txt"),
+    )
+
+@st.cache_data(show_spinner=False)
+def get_summary_for_base(base: str, mtime_key: int) -> tuple[str, list[str]]:
+    text, src_mtime = transcript_text_for_base(base)
+    if not text:
+        return "", []
+    sum_path, act_path = _summary_paths(base)
+    need = True
+    if os.path.exists(sum_path) and os.path.exists(act_path):
+        try:
+            need = os.path.getmtime(sum_path) < src_mtime or os.path.getmtime(act_path) < src_mtime
+        except Exception:
+            need = True
+    if need:
+        trimmed = text if len(text) <= 100_000 else text[:100_000]
+        summary = _summarize_textrank(trimmed, sentences=6) or "(no summary)"
+        actions = _extract_action_items(trimmed, limit=10)
+        try:
+            with open(sum_path, "w", encoding="utf-8") as f:
+                f.write(summary.strip() + "\n")
+            with open(act_path, "w", encoding="utf-8") as f:
+                f.write(("\n".join(f"- {a}" for a in actions) or "- (none)") + "\n")
+        except Exception:
+            pass
+        return summary, actions
+    else:
+        try:
+            with open(sum_path, encoding="utf-8", errors="ignore") as f:
+                summary = f.read().strip()
+        except Exception:
+            summary = "(no summary)"
+        try:
+            with open(act_path, encoding="utf-8", errors="ignore") as f:
+                actions = [ln.strip("- ").strip() for ln in f.read().splitlines() if ln.strip()]
+        except Exception:
+            actions = []
+        return summary, actions
+
 # ---------- audio helpers ----------
 AUDIO_EXTS = [".mp3", ".wav", ".m4a", ".flac", ".ogg"]
 
@@ -99,7 +204,6 @@ def load_audio_b64(path: str) -> tuple[str, str]:
 
 def snippet_player_html(mime: str, b64: str, start: float, end: float, key: str) -> str:
     """Small HTML audio with 'Play snippet' button that seeks to [start,end]."""
-    dur = max(0.0, end - start)
     safe_key = key.replace(".", "_").replace(":", "_")
     html_doc = f"""
     <div id="wrap_{safe_key}" style="font-family: ui-sans-serif,system-ui; margin: 6px 0;">
@@ -227,7 +331,7 @@ else:
                                file_name=f"{r['base']}_{int(r['start'])}-{int(r['end'])}.srt",
                                key=f"dl_snip_{r['base']}_{r['start']:.2f}")
 
-            # New: inline audio snippet player (if audio exists)
+            # Inline audio snippet player (if audio exists)
             audio_path = find_audio_for_base(r["base"])
             if audio_path and os.path.exists(audio_path):
                 mime, b64 = load_audio_b64(audio_path)
@@ -235,3 +339,34 @@ else:
                 components.html(html_player, height=120, scrolling=False)
             else:
                 st.warning("Audio not found for this transcript. To enable snippet playback, keep the original audio under outputs/ (add 'audio_saved' to JSON or place a file named like the base).")
+
+            # -------- Summary & Action items for this base --------
+            st.markdown("---")
+            st.markdown("**Summary & action items**")
+            _, src_mtime = transcript_text_for_base(r["base"])
+            mtime_key = int(src_mtime or 0)
+            with st.spinner("Loading..."):
+                summary, actions = get_summary_for_base(r["base"], mtime_key)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**Summary**")
+                st.write(summary or "(no summary)")
+                st.download_button(
+                    "⬇ Summary (TXT)",
+                    (summary or "(no summary)").encode("utf-8"),
+                    file_name=f"{r['base']}.summary.txt",
+                    key=f"sum_dl_{r['base']}_{r['start']:.2f}",
+                )
+            with c2:
+                st.markdown("**Action items**")
+                if actions:
+                    st.markdown("\n".join(f"- {a}" for a in actions))
+                else:
+                    st.write("(none)")
+                st.download_button(
+                    "⬇ Action items (TXT)",
+                    ("\n".join(f"- {a}" for a in actions) or "- (none)").encode("utf-8"),
+                    file_name=f"{r['base']}.action.txt",
+                    key=f"act_dl_{r['base']}_{r['start']:.2f}",
+                )
