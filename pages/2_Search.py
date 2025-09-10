@@ -1,8 +1,10 @@
-import os, glob
-from typing import Tuple
+import os, glob, json, base64, mimetypes
+from typing import Tuple, List
+
 import numpy as np
 import faiss
 import streamlit as st
+import streamlit.components.v1 as components
 from sentence_transformers import SentenceTransformer
 
 EMBED_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
@@ -11,6 +13,7 @@ OUTPUT_DIR = "outputs"
 st.set_page_config(page_title="Semantic search", layout="wide")
 st.title("🔎 Semantic search")
 
+# ---------- utils ----------
 def s_to_timestamp(s: float) -> str:
     h = int(s // 3600); m = int((s % 3600) // 60); sec = int(s % 60); ms = int((s - int(s)) * 1000)
     return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
@@ -56,6 +59,90 @@ def build_index(sig: str):
     index.add(emb_all)
     return index, emb_all, starts, ends, list(texts), bases
 
+# ---------- audio helpers ----------
+AUDIO_EXTS = [".mp3", ".wav", ".m4a", ".flac", ".ogg"]
+
+def meta_json_path(base: str) -> str:
+    return os.path.join(OUTPUT_DIR, f"{base}.json")
+
+def find_audio_for_base(base: str) -> str | None:
+    """Find audio file for given transcript base (via JSON meta or by scanning)."""
+    # 1) Try json meta 'audio_saved'
+    jp = meta_json_path(base)
+    if os.path.exists(jp):
+        try:
+            with open(jp, encoding="utf-8") as f:
+                meta = json.load(f)
+            aud_rel = meta.get("audio_saved")
+            if aud_rel:
+                p = os.path.join(OUTPUT_DIR, aud_rel)
+                if os.path.exists(p):
+                    return p
+        except Exception:
+            pass
+    # 2) Fallback: scan by known extensions
+    for ext in AUDIO_EXTS:
+        p = os.path.join(OUTPUT_DIR, f"{base}{ext}")
+        if os.path.exists(p):
+            return p
+    return None
+
+@st.cache_resource
+def load_audio_b64(path: str) -> tuple[str, str]:
+    """Return (mime, base64) for the audio file so we can embed in HTML."""
+    mime, _ = mimetypes.guess_type(path)
+    if not mime:
+        mime = "audio/mpeg"
+    with open(path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("ascii")
+    return mime, b64
+
+def snippet_player_html(mime: str, b64: str, start: float, end: float, key: str) -> str:
+    """Small HTML audio with 'Play snippet' button that seeks to [start,end]."""
+    dur = max(0.0, end - start)
+    safe_key = key.replace(".", "_").replace(":", "_")
+    html_doc = f"""
+    <div id="wrap_{safe_key}" style="font-family: ui-sans-serif,system-ui; margin: 6px 0;">
+      <audio id="aud_{safe_key}" controls preload="metadata" style="width:100%;">
+        <source src="data:{mime};base64,{b64}">
+      </audio>
+      <div style="margin-top:6px;">
+        <button id="btn_{safe_key}" style="padding:4px 10px; border:1px solid #888; border-radius:6px; cursor:pointer;">
+          ▶ Play snippet ({start:.1f}s → {end:.1f}s)
+        </button>
+        <button id="pause_{safe_key}" style="padding:4px 10px; margin-left:6px; border:1px solid #888; border-radius:6px; cursor:pointer;">
+          ⏸ Pause
+        </button>
+      </div>
+      <script>
+        (function() {{
+          const a = document.getElementById("aud_{safe_key}");
+          const btn = document.getElementById("btn_{safe_key}");
+          const pp = document.getElementById("pause_{safe_key}");
+          const start = {start:.3f};
+          const end = {end:.3f};
+          let guard = false;
+          btn.addEventListener("click", () => {{
+            if (!a) return;
+            a.currentTime = start;
+            a.play();
+            guard = true;
+          }});
+          pp.addEventListener("click", () => a && a.pause());
+          a.addEventListener("timeupdate", () => {{
+            if (!guard) return;
+            if (a.currentTime >= end) {{
+              a.pause();
+              guard = false;
+            }}
+          }});
+        }})();
+      </script>
+    </div>
+    """
+    return html_doc
+
+# ---------- page preconditions ----------
 if not os.path.isdir(OUTPUT_DIR):
     st.info("No outputs yet. Transcribe something first in the main page.")
     st.stop()
@@ -96,7 +183,7 @@ def norm_text(t: str) -> str:
     return " ".join(t.lower().split())
 
 seen = set()
-kept = []
+kept: List[dict] = []
 for idx, score in zip(I[0], D[0]):
     if idx < 0:
         continue
@@ -133,8 +220,18 @@ else:
             st.caption("Text")
             st.code(r["text"])
 
-            # Download single-cue SRT for the snippet
+            # Snippet SRT download
             snippet_srt = f"1\n{s_to_timestamp(r['start'])} --> {s_to_timestamp(r['end'])}\n{r['text'].strip()}\n"
-            st.download_button("⬇ SRT (this snippet)", snippet_srt.encode("utf-8"),
+            st.download_button("⬇ SRT (this snippet)",
+                               snippet_srt.encode("utf-8"),
                                file_name=f"{r['base']}_{int(r['start'])}-{int(r['end'])}.srt",
                                key=f"dl_snip_{r['base']}_{r['start']:.2f}")
+
+            # New: inline audio snippet player (if audio exists)
+            audio_path = find_audio_for_base(r["base"])
+            if audio_path and os.path.exists(audio_path):
+                mime, b64 = load_audio_b64(audio_path)
+                html_player = snippet_player_html(mime, b64, r["start"], r["end"], key=f"{r['base']}_{r['start']:.2f}")
+                components.html(html_player, height=120, scrolling=False)
+            else:
+                st.warning("Audio not found for this transcript. To enable snippet playback, keep the original audio under outputs/ (add 'audio_saved' to JSON or place a file named like the base).")

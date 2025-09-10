@@ -298,8 +298,8 @@ with kc2:
         wc = WordCloud(width=800, height=300, background_color=None, mode="RGBA")
         wc.generate_from_frequencies(dict(zip(kw["token"], kw["count"])))
         st.image(wc.to_array(), use_container_width=True)
-    else:
-        st.caption("Install `wordcloud` to see a word cloud (optional).")
+    #else:
+    #   st.caption("Install `wordcloud` to see a word cloud (optional).")
 
 st.markdown("---")
 
