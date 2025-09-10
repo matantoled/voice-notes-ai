@@ -2,6 +2,9 @@
 import os, glob, json, base64, mimetypes, re
 from typing import Tuple, List, Dict
 from collections import defaultdict
+from ui_style import inject_css, pill, kpi
+inject_css()
+
 
 import numpy as np
 import faiss

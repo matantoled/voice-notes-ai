@@ -1,6 +1,8 @@
 import os, glob, json, re
 from datetime import datetime, date
 from collections import Counter
+from ui_style import inject_css, pill, kpi
+inject_css()
 
 import numpy as np
 import pandas as pd

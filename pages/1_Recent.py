@@ -1,6 +1,9 @@
 import os, glob, json, re
 import pandas as pd
 import streamlit as st
+from ui_style import inject_css, pill, kpi
+inject_css()
+
 
 # ---------- page setup ----------
 st.set_page_config(page_title="Recent transcripts", layout="wide")

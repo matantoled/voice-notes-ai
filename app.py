@@ -3,6 +3,9 @@ from datetime import datetime
 import numpy as np
 import streamlit as st
 from faster_whisper import WhisperModel
+from ui_style import inject_css, pill, kpi
+inject_css()
+
 
 # Embeddings for semantic search (.npz)
 from sentence_transformers import SentenceTransformer
