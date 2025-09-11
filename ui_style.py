@@ -13,7 +13,6 @@ def inject_css():
     st.markdown(
         f"""
 <style>
-/* --- Base polish --- */
 :root {{
   --brand: {BRAND};
   --brand-dark: {BRAND_DARK};
@@ -23,13 +22,18 @@ def inject_css():
   --bad: {BAD};
   --muted: {MUTED};
 }}
-.block-container {{
-  padding-top: 1.2rem;
+
+/* Layout headroom so the title icon is not clipped */
+.block-container {{ padding-top: 1.6rem; }}                 /* a bit more space up top */
+.block-container h1:first-of-type {{ margin-top: .15rem; }}  /* ensure first h1 isn't flush */
+.stApp h1 {{ line-height: 1.25; overflow: visible; }}        /* give emoji ascenders room */
+.stApp h1 span[role="img"], .stApp h1 img, .stApp h1 svg {{
+  position: relative; top: .08em; display: inline-block;     /* tiny nudge down */
 }}
-/* Hide default footer line */
+
 footer {{ visibility: hidden; }}
 
-/* --- Buttons --- */
+/* Buttons */
 .stButton>button, .stDownloadButton>button {{
   border-radius: 9999px;
   padding: .55rem 1rem;
@@ -43,39 +47,33 @@ footer {{ visibility: hidden; }}
   box-shadow: 0 6px 18px rgba(124,58,237,.35);
   opacity: .95;
 }}
-/* Secondary style (use small buttons inside rows) */
 button.k-secondary {{
   background: rgba(255,255,255,.06) !important;
   border: 1px solid rgba(255,255,255,.14) !important;
   color: #e5e7eb !important;
 }}
-/* Icon-size tweak inside buttons */
-.stButton>button>div[data-testid="stMarkdownContainer"] p {{
-  margin: 0;
-}}
+.stButton>button>div[data-testid="stMarkdownContainer"] p {{ margin: 0; }}
 
-/* --- Expanders --- */
+/* Expanders */
 details.st-expander {{
   border-radius: 14px;
   border: 1px solid rgba(255,255,255,.08);
   background: rgba(255,255,255,.03);
 }}
-details.st-expander>summary {{
-  font-weight: 600;
-}}
+details.st-expander>summary {{ font-weight: 600; }}
 details.st-expander[open] {{
   background: rgba(255,255,255,.04);
   border-color: rgba(255,255,255,.14);
 }}
 
-/* --- Dataframe polish --- */
+/* Dataframe */
 div.stDataFrame, .stDataFrame [data-testid="stTable"] {{
   border-radius: 12px;
   overflow: hidden;
   border: 1px solid rgba(255,255,255,.08);
 }}
 
-/* --- Pills / badges --- */
+/* Pills */
 .pills {{ display:flex; gap:.4rem; flex-wrap: wrap; align-items:center; }}
 .pill {{
   display:inline-flex; align-items:center; gap:.35rem;
@@ -88,7 +86,7 @@ div.stDataFrame, .stDataFrame [data-testid="stTable"] {{
 .pill--warn  {{ background: rgba(245,158,11,.14); border-color: rgba(245,158,11,.45); }}
 .pill--muted {{ background: rgba(148,163,184,.14); border-color: rgba(148,163,184,.45); }}
 
-/* --- KPI cards (optional HTML) --- */
+/* KPI cards */
 .kpi {{
   border-radius:16px; padding:1rem 1.1rem;
   background: linear-gradient(135deg, rgba(124,58,237,.25), rgba(2,6,23,.4));
